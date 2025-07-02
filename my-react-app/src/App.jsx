@@ -15,11 +15,21 @@ function App() {
   const [wasListeningBeforeReconnect, setWasListeningBeforeReconnect] = useState(false)
   const [isWaitingToRestart, setIsWaitingToRestart] = useState(false)
   const [isResponsePending, setIsResponsePending] = useState(false)
+  const [showForm, setShowForm] = useState(false)
+  const [formData, setFormData] = useState({ username: '', email: '' })
+  const [formStatus, setFormStatus] = useState('')
+  const [waitingForWelcome, setWaitingForWelcome] = useState(false)
+  const [welcomeReceived, setWelcomeReceived] = useState(false)
+  const [silenceCount, setSilenceCount] = useState(0)
+  
   const wsRef = useRef(null)
   const mediaRecorderRef = useRef(null)
   const recognitionRef = useRef(null)
   const audioRef = useRef(null)
   const reconnectTimeoutRef = useRef(null)
+  const silenceTimeoutRef = useRef(null)
+  const silenceCountRef = useRef(0)
+  const isListeningForQuery = useRef(true)
   const WEBSOCKET_URL = "ws://localhost:8001/ws/ai-stream"
   const MAX_RECONNECT_ATTEMPTS = 5
   const RECONNECT_DELAY = 2000 // 2 seconds
@@ -37,10 +47,36 @@ function App() {
         setIsListening(true)
         setCurrentStatus('Listening...')
         setMessages(prev => [...prev, { type: 'system', content: 'Listening...', timestamp: new Date().toLocaleTimeString() }])
+        // Start silence timer
+        if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current)
+        silenceTimeoutRef.current = setTimeout(() => {
+          if (silenceCountRef.current === 0) {
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({ type: 'no_input_timeout' }))
+            }
+            setSilenceCount(1)
+          } else if (silenceCountRef.current === 1) {
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({ type: 'final_goodbye' }))
+            }
+            setSilenceCount(2)
+          }
+          // Optionally stop recognition to avoid double prompts
+          if (recognitionRef.current) {
+            try { recognitionRef.current.stop() } catch (e) {}
+          }
+        },6000)
       }
 
       recognitionRef.current.onresult = (event) => {
-        const transcript = event.results[0][0].transcript
+        if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current)
+        const transcript = event.results[0][0].transcript.toLowerCase()
+        console.log('🗣️ Transcript:', transcript, 'isListeningForQuery:', isListeningForQuery.current)
+        if (!isListeningForQuery.current) {
+          // Ignore all input during TTS
+          return
+        }
+        setSilenceCount(0)
         setCurrentStatus('Processing your request...')
         setMessages(prev => [...prev, { type: 'user', content: transcript, timestamp: new Date().toLocaleTimeString() }])
         setIsResponsePending(true)
@@ -54,6 +90,7 @@ function App() {
       }
 
       recognitionRef.current.onend = () => {
+        if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current)
         setIsListening(false)
         // Only restart listening if no response is pending
         if (isConnected && !isResponsePending && !isPlayingAudio && !isWaitingToRestart) {
@@ -85,7 +122,7 @@ function App() {
           console.error('Error stopping recognition:', error)
         }
       }
-      
+      isListeningForQuery.current = false // Not listening for hotwords during TTS
       audio.play().catch(error => {
         console.error('Error playing audio:', error)
         setIsPlayingAudio(false)
@@ -99,29 +136,38 @@ function App() {
       })
       
       audio.onended = () => {
+        isListeningForQuery.current = true // Resume normal listening after TTS
         URL.revokeObjectURL(audioUrl)
         setIsPlayingAudio(false)
         setAudioQueue(prevQueue => prevQueue.slice(1)) // Remove the played audio
         setIsResponsePending(false)
         setCurrentStatus('Audio finished, waiting to restart listening...')
         setIsWaitingToRestart(true)
-        // Wait longer before restarting voice recognition to avoid picking up audio
-        if (isConnected) {
+        // Disconnect after goodbye audio
+        if (silenceCount === 2) {
+          disconnectWebSocket()
+          setSilenceCount(0)
+          setIsWaitingToRestart(false)
+          setCurrentStatus('Disconnected after goodbye')
+          return
+        }
+        // Only restart listening if this was the last audio
+        if (audioQueue.length === 1) { // This was the last audio
           setTimeout(() => {
             setIsWaitingToRestart(false)
             setCurrentStatus('Ready to listen')
-            // Removed direct call to startVoiceRecognition here
             // Fallback: if still not listening after 3 seconds, force restart
             setTimeout(() => {
-              if (!isListening && isConnected && !isPlayingAudio) {
+              if (!isListening && isConnected && !isPlayingAudio && audioQueue.length === 0) {
                 console.log('Normal restart failed, trying force restart')
                 forceRestartVoiceRecognition()
               }
             }, 3000)
-          }, 2000) // Reduced delay to 2 seconds for better responsiveness
+          }, 500) // Add a 500ms delay before allowing listening to restart
         } else {
+          // There is more audio in the queue, do not restart listening yet
+          setCurrentStatus('More audio in queue, waiting...')
           setIsWaitingToRestart(false)
-          setCurrentStatus('Ready to listen')
         }
       }
     }
@@ -135,11 +181,12 @@ function App() {
       !isPlayingAudio &&
       !isResponsePending &&
       !isListening &&
-      recognitionRef.current
+      recognitionRef.current &&
+      audioQueue.length === 0 // Only start listening if all audio is finished
     ) {
       startVoiceRecognition()
     }
-  }, [isWaitingToRestart, isConnected, isPlayingAudio, isResponsePending, isListening])
+  }, [isWaitingToRestart, isConnected, isPlayingAudio, isResponsePending, isListening, audioQueue.length])
 
   // Auto-reconnect logic
   useEffect(() => {
@@ -159,7 +206,15 @@ function App() {
     }
   }, [autoReconnect, isConnected, reconnectAttempts])
 
+  useEffect(() => {
+    silenceCountRef.current = silenceCount
+  }, [silenceCount])
+
   const startVoiceRecognition = () => {
+    if (!welcomeReceived) {
+      setCurrentStatus('Please submit the form and wait for the welcome message.')
+      return
+    }
     console.log('Attempting to start voice recognition:', {
       hasRecognition: !!recognitionRef.current,
       isConnected,
@@ -234,10 +289,35 @@ function App() {
         setIsListening(true)
         setCurrentStatus('Listening...')
         setMessages(prev => [...prev, { type: 'system', content: 'Listening...', timestamp: new Date().toLocaleTimeString() }])
+        // Start silence timer
+        if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current)
+        silenceTimeoutRef.current = setTimeout(() => {
+          if (silenceCountRef.current === 0) {
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({ type: 'no_input_timeout' }))
+            }
+            setSilenceCount(1)
+          } else if (silenceCountRef.current === 1) {
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({ type: 'final_goodbye' }))
+            }
+            setSilenceCount(2)
+          }
+          if (recognitionRef.current) {
+            try { recognitionRef.current.stop() } catch (e) {}
+          }
+        }, 8000)
       }
 
       recognitionRef.current.onresult = (event) => {
-        const transcript = event.results[0][0].transcript
+        if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current)
+        const transcript = event.results[0][0].transcript.toLowerCase()
+        console.log('🗣️ Transcript:', transcript, 'isListeningForQuery:', isListeningForQuery.current)
+        if (!isListeningForQuery.current) {
+          // Ignore all input during TTS
+          return
+        }
+        setSilenceCount(0)
         setCurrentStatus('Processing your request...')
         setMessages(prev => [...prev, { type: 'user', content: transcript, timestamp: new Date().toLocaleTimeString() }])
         setIsResponsePending(true)
@@ -251,6 +331,7 @@ function App() {
       }
 
       recognitionRef.current.onend = () => {
+        if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current)
         setIsListening(false)
       }
       
@@ -276,11 +357,11 @@ function App() {
     }
   }
 
-  const connectWebSocket = () => {
+  const connectWebSocket = (onOpenCallback) => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      if (onOpenCallback) onOpenCallback()
       return
     }
-
     setConnectionStatus('connecting')
     setCurrentStatus('Connecting...')
     
@@ -290,21 +371,15 @@ function App() {
       wsRef.current.onopen = () => {
         setIsConnected(true)
         setConnectionStatus('connected')
-        setCurrentStatus('Connected! Ready to listen')
-        setReconnectAttempts(0) // Reset reconnect attempts on successful connection
-        
-        // Start voice recognition if we were listening before
-        if (wasListeningBeforeReconnect) {
-          setTimeout(() => {
-            startVoiceRecognition()
-          }, 1000)
-        }
-        
+        setCurrentStatus('Connected!')
+        setReconnectAttempts(0)
+        if (onOpenCallback) onOpenCallback()
         setMessages(prev => [...prev, { type: 'system', content: 'Connected to AI Assistant!', timestamp: new Date().toLocaleTimeString() }])
       }
       
       wsRef.current.onmessage = (event) => {
         try {
+          let isWelcome = false
           if (event.data instanceof Blob) {
             setAudioQueue(prevQueue => [...prevQueue, event.data])
             setCurrentStatus('Response received, playing...')
@@ -315,6 +390,12 @@ function App() {
               const jsonData = JSON.parse(event.data)
               if (jsonData.text) {
                 messageContent = jsonData.text
+                // Detect welcome message (robust)
+                if (messageContent.toLowerCase().includes('welcome')) {
+                  setWelcomeReceived(true)
+                  setWaitingForWelcome(false)
+                  setCurrentStatus('Welcome received! You can now start your query.')
+                }
               } else if (jsonData.error) {
                 setMessages(prev => [...prev, { type: 'error', content: `Error: ${jsonData.error}`, timestamp: new Date().toLocaleTimeString() }])
                 return
@@ -377,6 +458,8 @@ function App() {
   }
 
   const disconnectWebSocket = () => {
+    setSilenceCount(0)
+    silenceCountRef.current = 0
     setAutoReconnect(false) // Disable auto-reconnect when manually disconnecting
     setReconnectAttempts(0)
     setWasListeningBeforeReconnect(false)
@@ -451,11 +534,45 @@ function App() {
   }
 
   const handleConnect = () => {
+    setSilenceCount(0)
+    silenceCountRef.current = 0
     if (!isConnected) {
       setAutoReconnect(true) // Enable auto-reconnect when connecting
       connectWebSocket()
     } else {
       disconnectWebSocket()
+    }
+  }
+
+  // Form handlers
+  const handleFormChange = (e) => {
+    const { name, value } = e.target
+    setFormData(prev => ({ ...prev, [name]: value }))
+  }
+
+  const handleFormSubmit = async (e) => {
+    e.preventDefault()
+    setFormStatus('')
+    if (!formData.username || !formData.email) {
+      setFormStatus('Please fill in all fields.')
+      return
+    }
+    // Open/connect WebSocket if not connected
+    if (!isConnected) {
+      setAutoReconnect(false)
+      connectWebSocket(() => {
+        sendInitMessage()
+      })
+    } else {
+      sendInitMessage()
+    }
+    setWaitingForWelcome(true)
+    setShowForm(false)
+  }
+
+  const sendInitMessage = () => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'init', username: formData.username, email: formData.email }))
     }
   }
 
@@ -492,8 +609,44 @@ function App() {
               <p>Your intelligent voice companion</p>
             </div>
           </div>
+          {/* I Hate AI Button */}
+          <button style={{ marginLeft: 'auto', background: '#ff4d4f', color: 'white', border: 'none', borderRadius: '6px', padding: '8px 16px', cursor: 'pointer' }} onClick={() => setShowForm(true)}>
+            I Hate AI
+          </button>
         </div>
-
+        {/* Show Form Modal */}
+        {showForm && (
+          <div style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
+            <div style={{ background: 'white', padding: '32px', borderRadius: '12px', minWidth: '320px', boxShadow: '0 2px 16px rgba(0,0,0,0.2)' }}>
+              <h2>Tell us why you hate AI</h2>
+              <form onSubmit={handleFormSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <input
+                  type="text"
+                  name="username"
+                  placeholder="Username"
+                  value={formData.username}
+                  onChange={handleFormChange}
+                  required
+                  style={{ padding: '8px', borderRadius: '4px', border: '1px solid #ccc' }}
+                />
+                <input
+                  type="email"
+                  name="email"
+                  placeholder="Email"
+                  value={formData.email}
+                  onChange={handleFormChange}
+                  required
+                  style={{ padding: '8px', borderRadius: '4px', border: '1px solid #ccc' }}
+                />
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                  <button type="submit" style={{ background: '#1677ff', color: 'white', border: 'none', borderRadius: '4px', padding: '8px 16px', cursor: 'pointer' }}>Submit</button>
+                  <button type="button" style={{ background: '#aaa', color: 'white', border: 'none', borderRadius: '4px', padding: '8px 16px', cursor: 'pointer' }} onClick={() => { setShowForm(false); setFormStatus('') }}>Cancel</button>
+                </div>
+                {formStatus && <div style={{ color: formStatus.includes('success') ? 'green' : 'red', marginTop: '8px' }}>{formStatus}</div>}
+              </form>
+            </div>
+          </div>
+        )}
         {/* Connection Status */}
         <div className="connection-panel">
           <div className="status-display">
@@ -545,7 +698,7 @@ function App() {
         </div>
 
         {/* Main Voice Interface */}
-        {isConnected && (
+        {isConnected && welcomeReceived && (
           <div className="voice-interface">
             <div className="voice-visualizer">
               <div className={`voice-circle ${isRecording || isListening ? 'active' : ''} ${isPlayingAudio ? 'playing' : ''}`}>
@@ -606,8 +759,8 @@ function App() {
           </div>
         )}
 
-        {/* Welcome Screen when not connected */}
-        {!isConnected && (
+        {/* Welcome Screen when not connected or not welcomed */}
+        {(!isConnected || !welcomeReceived) && (
           <div className="welcome-screen">
             <div className="welcome-content">
               <div className="welcome-icon">
@@ -643,6 +796,7 @@ function App() {
                   <span>Auto-reconnection</span>
                 </div>
               </div>
+              {!welcomeReceived && <p style={{ color: '#1677ff', marginTop: '16px' }}>Please fill the form and wait for the welcome message before starting your query.</p>}
             </div>
           </div>
         )}
