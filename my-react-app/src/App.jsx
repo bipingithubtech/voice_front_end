@@ -30,6 +30,7 @@ function App() {
   const silenceTimeoutRef = useRef(null)
   const silenceCountRef = useRef(0)
   const isListeningForQuery = useRef(true)
+  const hotwordRecognitionRef = useRef(null)
   const WEBSOCKET_URL = "ws://localhost:8001/ws/ai-stream"
   const MAX_RECONNECT_ATTEMPTS = 5
   const RECONNECT_DELAY = 2000 // 2 seconds
@@ -123,10 +124,17 @@ function App() {
         }
       }
       isListeningForQuery.current = false // Not listening for hotwords during TTS
+
+      // --- Start hotword recognition for interruption ---
+      startHotwordRecognition()
+      // --- End hotword recognition start ---
+
       audio.play().catch(error => {
         console.error('Error playing audio:', error)
         setIsPlayingAudio(false)
         setCurrentStatus('Ready to listen')
+        // Stop hotword recognition if error
+        stopHotwordRecognition()
         // Restart voice recognition after error with longer delay
         if (isConnected && wasListeningBeforeReconnect) {
           setTimeout(() => {
@@ -143,6 +151,9 @@ function App() {
         setIsResponsePending(false)
         setCurrentStatus('Audio finished, waiting to restart listening...')
         setIsWaitingToRestart(true)
+        // --- Stop hotword recognition when audio ends ---
+        stopHotwordRecognition()
+        // --- End hotword recognition stop ---
         // Disconnect after goodbye audio
         if (silenceCount === 2) {
           disconnectWebSocket()
@@ -375,6 +386,10 @@ function App() {
         setReconnectAttempts(0)
         if (onOpenCallback) onOpenCallback()
         setMessages(prev => [...prev, { type: 'system', content: 'Connected to AI Assistant!', timestamp: new Date().toLocaleTimeString() }])
+        // Auto-send init message after reconnect if form data is present and welcome not received
+        if (formData.username && formData.email && !welcomeReceived) {
+          sendInitMessage();
+        }
       }
       
       wsRef.current.onmessage = (event) => {
@@ -463,6 +478,7 @@ function App() {
     setAutoReconnect(false) // Disable auto-reconnect when manually disconnecting
     setReconnectAttempts(0)
     setWasListeningBeforeReconnect(false)
+    setWelcomeReceived(false); // <-- Add this line to only reset on manual disconnect
     
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current)
@@ -576,6 +592,63 @@ function App() {
     }
   }
 
+  // --- Hotword recognition for interruption ---
+  const startHotwordRecognition = () => {
+    if (!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) return
+    if (hotwordRecognitionRef.current) {
+      try { hotwordRecognitionRef.current.stop() } catch (e) {}
+      hotwordRecognitionRef.current = null
+    }
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
+    const hotwordRec = new SpeechRecognition()
+    hotwordRec.continuous = true
+    hotwordRec.interimResults = false
+    hotwordRec.lang = 'en-US'
+    hotwordRec.onresult = (event) => {
+      const transcript = event.results[event.results.length - 1][0].transcript.toLowerCase().trim()
+      if (transcript && transcript.length > 0) {
+        // Stop audio and clear queue
+        if (audioRef.current) {
+          audioRef.current.pause()
+          audioRef.current.currentTime = 0
+        }
+        setAudioQueue([])
+        setIsPlayingAudio(false)
+        setCurrentStatus('Playback interrupted by voice command')
+        setIsWaitingToRestart(false)
+        stopHotwordRecognition()
+        isListeningForQuery.current = true;
+        setTimeout(() => {
+          startVoiceRecognition()
+        }, 500)
+      }
+    }
+    hotwordRec.onerror = (event) => {
+      // Optionally restart hotword recognition on error
+      try { hotwordRec.stop() } catch (e) {}
+      setTimeout(() => {
+        if (isPlayingAudio) startHotwordRecognition()
+      }, 500)
+    }
+    hotwordRec.onend = () => {
+      // Optionally restart hotword recognition if audio is still playing
+      if (isPlayingAudio) {
+        setTimeout(() => {
+          startHotwordRecognition()
+        }, 200)
+      }
+    }
+    hotwordRecognitionRef.current = hotwordRec
+    try { hotwordRec.start() } catch (e) {}
+  }
+  const stopHotwordRecognition = () => {
+    if (hotwordRecognitionRef.current) {
+      try { hotwordRecognitionRef.current.stop() } catch (e) {}
+      hotwordRecognitionRef.current = null
+    }
+  }
+  // --- End hotword recognition ---
+
   useEffect(() => {
     return () => {
       if (reconnectTimeoutRef.current) {
@@ -586,6 +659,9 @@ function App() {
       }
       if (recognitionRef.current) {
         recognitionRef.current.stop()
+      }
+      if (hotwordRecognitionRef.current) {
+        try { hotwordRecognitionRef.current.stop() } catch (e) {}
       }
     }
   }, [])
