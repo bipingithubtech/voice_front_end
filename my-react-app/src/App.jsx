@@ -66,7 +66,7 @@ function App() {
           if (recognitionRef.current) {
             try { recognitionRef.current.stop() } catch (e) {}
           }
-        },6000)
+        },9000)
       }
 
       recognitionRef.current.onresult = (event) => {
@@ -386,10 +386,6 @@ function App() {
         setReconnectAttempts(0)
         if (onOpenCallback) onOpenCallback()
         setMessages(prev => [...prev, { type: 'system', content: 'Connected to AI Assistant!', timestamp: new Date().toLocaleTimeString() }])
-        // Auto-send init message after reconnect if form data is present and welcome not received
-        if (formData.username && formData.email && !welcomeReceived) {
-          sendInitMessage();
-        }
       }
       
       wsRef.current.onmessage = (event) => {
@@ -478,7 +474,6 @@ function App() {
     setAutoReconnect(false) // Disable auto-reconnect when manually disconnecting
     setReconnectAttempts(0)
     setWasListeningBeforeReconnect(false)
-    setWelcomeReceived(false); // <-- Add this line to only reset on manual disconnect
     
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current)
